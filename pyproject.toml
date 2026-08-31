@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "emby-theme-worker"
+version = "0.1.0"
+description = "Private headless Emby theme song worker"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+dependencies = [
+  "croniter==6.0.0",
+  "httpx==0.28.1",
+  "PyYAML==6.0.2",
+  "rapidfuzz==3.13.0",
+  "yt-dlp==2026.8.19",
+]
+
+[project.scripts]
+emby-theme-worker = "emby_theme_worker.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["emby_theme_worker"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[project.optional-dependencies]
+test = ["pytest==8.4.1"]

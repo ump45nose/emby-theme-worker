@@ -1,0 +1,28 @@
+services:
+  emby-theme-worker:
+    image: local/emby-theme-worker:0.1.0
+    container_name: emby-theme-worker
+    network_mode: host
+    user: "1000:1001"
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      TZ: Asia/Taipei
+      EMBY_THEME_CONFIG: /config/config.yaml
+    volumes:
+      - /vol1/1000/Media:/Media:rw
+      - /vol2/1000/Docker/emby-theme-worker/data:/data:rw
+      - /vol2/1000/Docker/emby-theme-worker/config:/config:ro
+      - /vol2/1000/Docker/emby-theme-worker/secrets:/run/secrets:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=2g,uid=1000,gid=1001,mode=1770
+    healthcheck:
+      test: ["CMD", "emby-theme-worker", "health"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 30s

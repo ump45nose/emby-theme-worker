@@ -1,0 +1,10 @@
+__pycache__/
+.pytest_cache/
+.venv/
+*.pyc
+*.db
+*.sqlite*
+.env
+secrets/
+dist/
+build/
