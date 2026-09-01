@@ -1,6 +1,6 @@
 services:
   emby-theme-worker:
-    image: local/emby-theme-worker:0.1.0
+    image: local/emby-theme-worker:0.1.1
     container_name: emby-theme-worker
     network_mode: host
     user: "1000:1001"

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -12,6 +14,7 @@ from emby_theme_worker.models import Candidate, MediaItem
 from emby_theme_worker.scoring import score_candidate
 from emby_theme_worker.security import RedactingFilter, contained, redact, safe_http_url_from_strm
 from emby_theme_worker.worker import Worker
+from emby_theme_worker.ytdlp_runner import YtDlpTimeout, _run
 
 
 def item(path: Path, item_type: str = "Movie") -> MediaItem:
@@ -25,6 +28,13 @@ def test_config_validation(tmp_path: Path) -> None:
     config_file.write_text("allowed_path: relative\n", encoding="utf-8")
     with pytest.raises(ValueError):
         Config.load(config_file)
+
+
+def test_ytdlp_wall_clock_timeout() -> None:
+    started = time.monotonic()
+    with pytest.raises(YtDlpTimeout):
+        _run([sys.executable, "-c", "import time; time.sleep(10)"], 1)
+    assert time.monotonic() - started < 3
 
 
 def test_path_containment() -> None:

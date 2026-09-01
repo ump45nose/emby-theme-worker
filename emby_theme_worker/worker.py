@@ -28,8 +28,15 @@ class Worker:
             config.limits.network_concurrency,
             db,
             config.providers.cookies,
+            config.providers.ytdlp_search_timeout_seconds,
         )
-        self.audio = AudioProcessor(config.target_seconds, config.output_bitrate, config.providers.timeout_seconds, config.providers.cookies)
+        self.audio = AudioProcessor(
+            config.target_seconds,
+            config.output_bitrate,
+            config.providers.timeout_seconds,
+            config.providers.cookies,
+            config.providers.ytdlp_download_timeout_seconds,
+        )
 
     def close(self) -> None:
         self.providers.close()
@@ -215,6 +222,7 @@ class Worker:
                 self.db.record_item(item, "complete", provider=provider, score=score, output_path=str(target), output_sha256=digest)
                 return {"item_id": item.id, "status": "complete", "provider": provider, "score": score, "path": str(target), "sha256": digest, "duration": info["duration"]}
             self.db.set_meta("theme_registration_mode", "full_scan")
+        self.db.provider_success(provider)
         self.db.record_item(item, "pending_refresh", provider=provider, score=score, output_path=str(target), output_sha256=digest)
         return {"item_id": item.id, "status": "pending_refresh", "provider": provider, "score": score, "path": str(target), "sha256": digest, "duration": info["duration"]}
 

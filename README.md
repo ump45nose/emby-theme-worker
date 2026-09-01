@@ -54,7 +54,7 @@ The supplied image pins Python 3.12, FFmpeg 7.1.5, yt-dlp 2026.8.19, and all Pyt
    ```bash
    gh repo clone ump45nose/emby-theme-worker
    cd emby-theme-worker
-   docker build --pull=false -t local/emby-theme-worker:0.1.0 .
+   docker build --pull=false -t local/emby-theme-worker:0.1.1 .
    ```
 
 2. Create persistent directories and copy the public configuration:
@@ -126,6 +126,8 @@ Public settings live in `config/config.yaml`:
 | `schedule` | `0 3 * * *` | Cron schedule interpreted in `timezone` |
 | `target_seconds` | `45` | Output duration |
 | `providers.threshold` | `75` | Minimum fuzzy auto-selection score |
+| `providers.ytdlp_search_timeout_seconds` | `60` | Hard wall-clock deadline for one yt-dlp search |
+| `providers.ytdlp_download_timeout_seconds` | `180` | Hard wall-clock deadline for one yt-dlp download |
 | `limits.network_concurrency` | `2` | Concurrent provider lookups |
 | `limits.media_concurrency` | `1` | Download and FFmpeg concurrency boundary |
 | `refresh.full_scan_after_scheduled_run` | `true` | Register pending files with one end-of-batch scan |
@@ -166,7 +168,7 @@ To roll back, stop or recreate only this independent container with a retained i
 
 ```bash
 docker compose stop emby-theme-worker
-docker tag local/emby-theme-worker:rollback-last-deployed local/emby-theme-worker:0.1.0
+docker tag local/emby-theme-worker:rollback-last-deployed local/emby-theme-worker:0.1.1
 docker compose up -d --force-recreate
 ```
 

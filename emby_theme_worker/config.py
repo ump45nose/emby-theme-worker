@@ -23,6 +23,8 @@ class ProviderSettings:
         "tunefind", "youtube", "bilibili", "netease", "qqmusic",
     ])
     timeout_seconds: int = 30
+    ytdlp_search_timeout_seconds: int = 60
+    ytdlp_download_timeout_seconds: int = 180
     threshold: int = 75
     cookies: dict[str, str] = field(default_factory=dict)
 
@@ -72,5 +74,9 @@ class Config:
             raise ValueError("target_seconds must be between 15 and 180")
         if not 0 <= self.providers.threshold <= 100:
             raise ValueError("providers.threshold must be between 0 and 100")
+        if self.providers.ytdlp_search_timeout_seconds < 5:
+            raise ValueError("providers.ytdlp_search_timeout_seconds must be at least 5")
+        if self.providers.ytdlp_download_timeout_seconds < 15:
+            raise ValueError("providers.ytdlp_download_timeout_seconds must be at least 15")
         if len(self.schedule.split()) != 5:
             raise ValueError("schedule must be a five-field cron expression")

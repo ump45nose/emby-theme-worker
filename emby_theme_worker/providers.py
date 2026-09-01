@@ -8,11 +8,10 @@ from html import unescape
 from urllib.parse import quote, urljoin
 
 import httpx
-import yt_dlp
-
 from .db import StateDB
 from .models import Candidate, MediaItem
 from .scoring import normalize
+from .ytdlp_runner import search as ytdlp_search
 
 
 LOG = logging.getLogger(__name__)
@@ -20,12 +19,21 @@ UA = "emby-theme-worker/0.1 (+private-home-instance)"
 
 
 class Providers:
-    def __init__(self, enabled: list[str], timeout: int, concurrency: int, db: StateDB, cookies: dict[str, str]):
+    def __init__(
+        self,
+        enabled: list[str],
+        timeout: int,
+        concurrency: int,
+        db: StateDB,
+        cookies: dict[str, str],
+        ytdlp_search_timeout: int = 60,
+    ):
         self.enabled = set(enabled)
         self.timeout = timeout
         self.concurrency = concurrency
         self.db = db
         self.cookies = cookies
+        self.ytdlp_search_timeout = ytdlp_search_timeout
         self.http = httpx.Client(timeout=timeout, follow_redirects=True, headers={"User-Agent": UA})
 
     def close(self) -> None:
@@ -46,9 +54,9 @@ class Providers:
                 continue
             try:
                 candidate = method(item)  # type: ignore[operator]
-                self.db.provider_success(name)
                 if candidate:
                     return [candidate]
+                self.db.provider_success(name)
             except Exception as exc:
                 LOG.warning("exact provider %s failed: %s", name, exc.__class__.__name__)
                 self.db.provider_failure(name, exc.__class__.__name__)
@@ -198,12 +206,13 @@ class Providers:
         return [Candidate("tunefind", title, f"ytsearch1:{title}", metadata={"search_only": True}) for title in titles[:5]]
 
     def _ytdlp_search(self, provider: str, prefix: str, item: MediaItem) -> list[Candidate]:
-        opts: dict = {"quiet": True, "no_warnings": True, "extract_flat": True, "playlistend": 5, "socket_timeout": self.timeout, "cachedir": False}
         cookie = self.cookies.get(provider)
-        if cookie:
-            opts["cookiefile"] = cookie
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"{prefix}5:{self._query(item)}", download=False)
+        info = ytdlp_search(
+            f"{prefix}5:{self._query(item)}",
+            cookie_file=cookie,
+            socket_timeout_seconds=self.timeout,
+            hard_timeout_seconds=self.ytdlp_search_timeout,
+        )
         candidates: list[Candidate] = []
         for entry in (info or {}).get("entries") or []:
             if not entry:

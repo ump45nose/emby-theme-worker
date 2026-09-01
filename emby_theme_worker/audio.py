@@ -12,21 +12,28 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
-import yt_dlp
-
 from .models import Candidate
 from .security import safe_http_url_from_strm
+from .ytdlp_runner import download as ytdlp_download
 
 
 LOG = logging.getLogger(__name__)
 
 
 class AudioProcessor:
-    def __init__(self, target_seconds: int, bitrate: str, timeout: int, cookies: dict[str, str]):
+    def __init__(
+        self,
+        target_seconds: int,
+        bitrate: str,
+        timeout: int,
+        cookies: dict[str, str],
+        ytdlp_download_timeout: int = 180,
+    ):
         self.target_seconds = target_seconds
         self.bitrate = bitrate
         self.timeout = timeout
         self.cookies = cookies
+        self.ytdlp_download_timeout = ytdlp_download_timeout
 
     def fetch_candidate(self, candidate: Candidate, workdir: Path) -> Path:
         source = candidate.source_url
@@ -46,24 +53,14 @@ class AudioProcessor:
 
     def _ytdlp(self, url: str, provider: str, workdir: Path) -> Path:
         template = str(workdir / "source.%(ext)s")
-        opts: dict = {
-            "quiet": True,
-            "no_warnings": True,
-            "format": "bestaudio/best",
-            "outtmpl": template,
-            "noplaylist": True,
-            "socket_timeout": self.timeout,
-            "retries": 3,
-            "cachedir": False,
-        }
         cookie = self.cookies.get(provider) or self.cookies.get("youtube")
-        if cookie:
-            opts["cookiefile"] = cookie
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            path = Path(ydl.prepare_filename(info))
-        if path.exists():
-            return path
+        ytdlp_download(
+            url,
+            output_template=Path(template),
+            cookie_file=cookie,
+            socket_timeout_seconds=self.timeout,
+            hard_timeout_seconds=self.ytdlp_download_timeout,
+        )
         matches = list(workdir.glob("source.*"))
         if not matches:
             raise FileNotFoundError("yt-dlp produced no media")

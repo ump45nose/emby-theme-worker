@@ -27,6 +27,8 @@ providers:
     - netease
     - qqmusic
   timeout_seconds: 30
+  ytdlp_search_timeout_seconds: 60
+  ytdlp_download_timeout_seconds: 180
   threshold: 75
   cookies:
     youtube: /run/secrets/youtube.cookies.txt
