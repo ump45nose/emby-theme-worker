@@ -13,6 +13,10 @@ services:
     environment:
       TZ: Asia/Taipei
       EMBY_THEME_CONFIG: /config/config.yaml
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      ALL_PROXY: ${ALL_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,::1}
     volumes:
       - /vol1/1000/Media:/Media:rw
       - /vol2/1000/Docker/emby-theme-worker/data:/data:rw
