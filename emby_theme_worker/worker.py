@@ -153,29 +153,31 @@ class Worker:
             self.db.record_item(item, "skipped_existing_unindexed", output_path=str(target), output_sha256=sha256(target))
             return {"item_id": item.id, "status": "skipped_existing_unindexed"}
 
+        errors: list[str] = []
         exact = self.providers.exact(item)
         for candidate in exact:
             candidate.score = 100
-        fuzzy: list[Candidate] = [] if exact else score_all(self.providers.fuzzy(item), item)
-        candidates = exact + [c for c in fuzzy if c.score >= self.config.providers.threshold]
-        for candidate in exact + fuzzy:
-            url_hash = hashlib.sha256(candidate.source_url.encode()).hexdigest()
-            self.db.record_candidate(item.id, candidate, url_hash)
+        self._record_candidates(item, exact)
+        result = self._try_candidates(item, exact, errors, route="exact")
+        if result:
+            return result
 
-        errors: list[str] = []
-        for candidate in candidates:
-            try:
-                return self._from_candidate(item, candidate)
-            except Exception as exc:
-                errors.append(f"{candidate.provider}:{exc.__class__.__name__}")
-                self.db.provider_failure(candidate.provider, exc.__class__.__name__)
-                LOG.warning("candidate failed item=%s provider=%s error=%s", item.id, candidate.provider, exc.__class__.__name__)
+        # An exact database match identifies the desired theme, but it does not
+        # guarantee that the referenced transport (usually YouTube) is usable.
+        # Search the independent providers after a transport failure instead of
+        # skipping directly to local opening extraction.
+        fuzzy = score_all(self.providers.fuzzy(item), item)
+        self._record_candidates(item, fuzzy)
+        eligible = [candidate for candidate in fuzzy if candidate.score >= self.config.providers.threshold]
+        result = self._try_candidates(item, eligible, errors, route="fuzzy")
+        if result:
+            return result
 
         try:
             return self._from_local(item)
         except Exception as exc:
             errors.append(f"local:{exc.__class__.__name__}")
-            error_class = "low_score" if fuzzy and not candidates else "not_found"
+            error_class = "low_score" if fuzzy and not eligible else "not_found"
             if any("HTTP" in err or "Timeout" in err for err in errors):
                 error_class = "network"
             if error_class == "network":
@@ -188,6 +190,36 @@ class Worker:
                 retry = self.db.backoff_until(days=self.config.backoff["not_found_days"])
             self.db.record_item(item, "failed", error_class=error_class, error=";".join(errors), retry_after=retry)
             return {"item_id": item.id, "status": "failed", "error_class": error_class, "errors": errors}
+
+    def _record_candidates(self, item: MediaItem, candidates: list[Candidate]) -> None:
+        for candidate in candidates:
+            url_hash = hashlib.sha256(candidate.source_url.encode()).hexdigest()
+            self.db.record_candidate(item.id, candidate, url_hash)
+
+    def _try_candidates(
+        self,
+        item: MediaItem,
+        candidates: list[Candidate],
+        errors: list[str],
+        *,
+        route: str,
+    ) -> dict | None:
+        for candidate in candidates:
+            transport = str(candidate.metadata.get("transport") or "direct")
+            LOG.info(
+                "candidate attempt item=%s route=%s provider=%s transport=%s score=%s",
+                item.id, route, candidate.provider, transport, candidate.score,
+            )
+            try:
+                return self._from_candidate(item, candidate)
+            except Exception as exc:
+                errors.append(f"{candidate.provider}:{exc.__class__.__name__}")
+                self.db.provider_failure(candidate.provider, exc.__class__.__name__)
+                LOG.warning(
+                    "candidate failed item=%s route=%s provider=%s transport=%s error=%s",
+                    item.id, route, candidate.provider, transport, exc.__class__.__name__,
+                )
+        return None
 
     def _from_candidate(self, item: MediaItem, candidate: Candidate) -> dict:
         with temporary_directory() as work:

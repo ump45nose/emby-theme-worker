@@ -109,3 +109,41 @@ def test_existing_theme_is_skipped(tmp_path: Path) -> None:
         worker.close()
     assert result["status"] == "skipped_existing"
     assert sha256(theme) == before
+
+
+def test_exact_transport_failure_falls_back_to_fuzzy(tmp_path: Path) -> None:
+    media_dir = tmp_path / "Movie"
+    media_dir.mkdir()
+    media = item(media_dir)
+
+    class FakeEmby:
+        def theme_visible(self, _item_id: str) -> bool:
+            return False
+
+    class FakeProviders:
+        def exact(self, _item: MediaItem) -> list[Candidate]:
+            return [Candidate("themerrdb", "Exact theme", "https://youtube.test/exact", exact=True)]
+
+        def fuzzy(self, _item: MediaItem) -> list[Candidate]:
+            return [Candidate("archive", "Example Show 2025 Official Main Theme Soundtrack", "https://archive.test/theme.mp3", year=2025, media_type="Movie", duration=180)]
+
+    config = Config(database_path=str(tmp_path / "state.db"), allowed_path=str(tmp_path))
+    db = StateDB(config.database_path)
+    db.initialize()
+    worker = object.__new__(Worker)
+    worker.config = config
+    worker.db = db
+    worker.emby = FakeEmby()
+    worker.providers = FakeProviders()
+    attempted: list[str] = []
+
+    def from_candidate(_item: MediaItem, candidate: Candidate) -> dict:
+        attempted.append(candidate.provider)
+        if candidate.provider == "themerrdb":
+            raise TimeoutError("exact transport unavailable")
+        return {"item_id": media.id, "status": "complete", "provider": candidate.provider}
+
+    worker._from_candidate = from_candidate  # type: ignore[method-assign]
+    result = worker.process(media)
+    assert result["provider"] == "archive"
+    assert attempted == ["themerrdb", "archive"]

@@ -105,9 +105,15 @@ class StateDB:
 
     def start_run(self, mode: str) -> int:
         with self.connect() as conn:
+            stamp = now()
+            conn.execute(
+                "UPDATE runs SET finished_at=?,status='interrupted',"
+                "error=COALESCE(error,'superseded by a new run') WHERE status='running'",
+                (stamp,),
+            )
             cur = conn.execute(
                 "INSERT INTO runs(started_at,mode,status) VALUES(?,?,?)",
-                (now(), mode, "running"),
+                (stamp, mode, "running"),
             )
             return int(cur.lastrowid)
 

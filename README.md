@@ -54,7 +54,7 @@ The supplied image pins Python 3.12, FFmpeg 7.1.5, yt-dlp 2026.8.19, and all Pyt
    ```bash
    gh repo clone ump45nose/emby-theme-worker
    cd emby-theme-worker
-   docker build --pull=false -t local/emby-theme-worker:0.1.1 .
+   docker build --pull=false -t local/emby-theme-worker:0.1.2 .
    ```
 
 2. Create persistent directories and copy the public configuration:
@@ -168,7 +168,7 @@ To roll back, stop or recreate only this independent container with a retained i
 
 ```bash
 docker compose stop emby-theme-worker
-docker tag local/emby-theme-worker:rollback-last-deployed local/emby-theme-worker:0.1.1
+docker tag local/emby-theme-worker:rollback-last-deployed local/emby-theme-worker:0.1.2
 docker compose up -d --force-recreate
 ```
 

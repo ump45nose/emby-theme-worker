@@ -83,7 +83,11 @@ class Providers:
                 try:
                     found = future.result()
                     results.extend(found)
-                    self.db.provider_success(name)
+                    # A non-empty search result is only discovery success. Keep
+                    # prior transport failures until a candidate is downloaded
+                    # and committed; otherwise every search masks yt-dlp faults.
+                    if not found:
+                        self.db.provider_success(name)
                 except Exception as exc:  # providers are isolated by design
                     LOG.warning("provider %s failed: %s", name, exc.__class__.__name__)
                     self.db.provider_failure(name, exc.__class__.__name__)
@@ -142,7 +146,11 @@ class Providers:
         source = payload.get("youtube_theme_url")
         if not source:
             return None
-        return Candidate("themerrdb", f"{item.original_title or item.name} main theme", source, exact=True, year=item.year, media_type=item.item_type)
+        return Candidate(
+            "themerrdb", f"{item.original_title or item.name} main theme", source,
+            exact=True, year=item.year, media_type=item.item_type,
+            metadata={"transport": "youtube/yt-dlp"},
+        )
 
     def plex_tv(self, item: MediaItem) -> Candidate | None:
         tvdb = item.provider_ids.get("Tvdb") or item.provider_ids.get("TVDb")
@@ -221,7 +229,10 @@ class Providers:
             if source and not str(source).startswith("http") and provider == "youtube":
                 source = f"https://www.youtube.com/watch?v={source}"
             if source:
-                candidates.append(Candidate(provider, entry.get("title") or self._query(item), str(source), duration=entry.get("duration")))
+                candidates.append(Candidate(
+                    provider, entry.get("title") or self._query(item), str(source),
+                    duration=entry.get("duration"), metadata={"transport": f"{provider}/yt-dlp"},
+                ))
         return candidates
 
     def youtube(self, item: MediaItem) -> list[Candidate]:
@@ -241,8 +252,13 @@ class Providers:
         payload = self.http.get("https://music.163.com/api/search/get", params={"s": self._query(item), "type": 1, "limit": 5, "offset": 0}).raise_for_status().json()
         rows = payload.get("result", {}).get("songs", [])
         return [
-            Candidate("netease", f"{row.get('name','')} - {'/'.join(a.get('name','') for a in row.get('artists',[]))}", f"ytsearch1:{row.get('name','')} {' '.join(a.get('name','') for a in row.get('artists',[]))}", duration=(row.get("duration") or 0) / 1000, metadata={"search_only": True, "catalog_id": str(row.get("id", ""))})
-            for row in rows
+            Candidate(
+                "netease", f"{row.get('name','')} - {'/'.join(a.get('name','') for a in row.get('artists',[]))}",
+                f"https://music.163.com/#/song?id={row.get('id')}",
+                duration=(row.get("duration") or 0) / 1000,
+                metadata={"catalog_id": str(row.get("id", "")), "transport": "netease/yt-dlp"},
+            )
+            for row in rows if row.get("id")
         ]
 
     def qqmusic(self, item: MediaItem) -> list[Candidate]:
@@ -250,8 +266,13 @@ class Providers:
         payload = self.http.get("https://c.y.qq.com/soso/fcgi-bin/client_search_cp", params=params, headers={"Referer": "https://y.qq.com/"}).raise_for_status().json()
         rows = payload.get("data", {}).get("song", {}).get("list", [])
         return [
-            Candidate("qqmusic", f"{row.get('songname','')} - {'/'.join(a.get('name','') for a in row.get('singer',[]))}", f"ytsearch1:{row.get('songname','')} {' '.join(a.get('name','') for a in row.get('singer',[]))}", duration=row.get("interval"), metadata={"search_only": True, "catalog_id": row.get("songmid")})
-            for row in rows
+            Candidate(
+                "qqmusic", f"{row.get('songname','')} - {'/'.join(a.get('name','') for a in row.get('singer',[]))}",
+                f"https://y.qq.com/n/ryqq/songDetail/{row.get('songmid')}",
+                duration=row.get("interval"),
+                metadata={"catalog_id": row.get("songmid"), "transport": "qqmusic/yt-dlp"},
+            )
+            for row in rows if row.get("songmid")
         ]
 
 
