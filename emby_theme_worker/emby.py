@@ -113,9 +113,17 @@ class EmbyClient:
         common = {"Recursive": False, "ImageRefreshMode": "Default", "ReplaceAllImages": False, "ReplaceAllMetadata": False}
         for mode in ("Default", "FullRefresh"):
             params = dict(common, MetadataRefreshMode=mode)
-            self.client.post(f"/Items/{item_id}/Refresh", params=params).raise_for_status()
+            try:
+                self.client.post(f"/Items/{item_id}/Refresh", params=params).raise_for_status()
+            except httpx.HTTPError:
+                # A slow Emby refresh must not abort the whole bootstrap.  The
+                # caller will retain the output for a later library scan.
+                continue
             for _ in range(attempts):
-                payload = self.client.get(f"/Items/{item_id}/ThemeSongs").raise_for_status().json()
+                try:
+                    payload = self.client.get(f"/Items/{item_id}/ThemeSongs").raise_for_status().json()
+                except httpx.HTTPError:
+                    continue
                 if payload.get("Items"):
                     return True
                 time.sleep(delay)

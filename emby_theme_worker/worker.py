@@ -144,7 +144,16 @@ class Worker:
                 and sha256(target) == state["output_sha256"]
             )
             if owned:
-                self.db.set_meta("theme_registration_mode", "full_scan")
+                # A prior full scan may have missed this sidecar.  Retry the
+                # item's documented Default -> FullRefresh route before adding
+                # it to another (expensive) library-wide scan.
+                if self.emby.refresh_and_verify(item.id):
+                    self.db.provider_success(state.get("source_provider") or "local_opening")
+                    self.db.record_item(
+                        item, "complete", provider=state.get("source_provider"), score=state.get("score"),
+                        output_path=str(target), output_sha256=state["output_sha256"],
+                    )
+                    return {"item_id": item.id, "status": "complete", "provider": state.get("source_provider")}
                 self.db.record_item(
                     item, "pending_refresh", provider=state.get("source_provider"), score=state.get("score"),
                     output_path=str(target), output_sha256=state["output_sha256"],
@@ -273,6 +282,15 @@ class Worker:
         completed = 0
         for item_id in pending:
             if not self.emby.theme_visible(item_id):
+                # Do not claim completion without ThemeSongs readback.  These
+                # files remain on disk for audit/manual intervention, but a
+                # bounded registration failure must not restart bootstrap
+                # indefinitely.
+                self.db.record_registration_failure(
+                    item_id,
+                    self.db.backoff_until(days=self.config.backoff["registration_days"]),
+                )
+                LOG.warning("theme remains unindexed after refresh and library scan item=%s", item_id)
                 continue
             item = self.emby.get_item(item_id)
             state = self.db.item_state(item_id) or {}

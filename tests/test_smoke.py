@@ -6,10 +6,12 @@ import time
 from pathlib import Path
 
 import pytest
+import httpx
 
 from emby_theme_worker.audio import AudioProcessor, sha256
 from emby_theme_worker.config import Config
 from emby_theme_worker.db import StateDB
+from emby_theme_worker.emby import EmbyClient
 from emby_theme_worker.models import Candidate, MediaItem
 from emby_theme_worker.scoring import score_candidate
 from emby_theme_worker.security import RedactingFilter, contained, redact, safe_http_url_from_strm
@@ -147,3 +149,45 @@ def test_exact_transport_failure_falls_back_to_fuzzy(tmp_path: Path) -> None:
     result = worker.process(media)
     assert result["provider"] == "archive"
     assert attempted == ["themerrdb", "archive"]
+
+
+def test_unregistered_pending_output_becomes_registration_failure(tmp_path: Path) -> None:
+    media_dir = tmp_path / "Movie"
+    media_dir.mkdir()
+    media = item(media_dir)
+    config = Config(database_path=str(tmp_path / "state.db"), allowed_path=str(tmp_path))
+    db = StateDB(config.database_path)
+    db.initialize()
+    db.record_item(media, "pending_refresh", provider="local_opening", output_path=str(media_dir / "theme.mp3"), output_sha256="a" * 64)
+
+    class FakeEmby:
+        def trigger_library_scan(self) -> None:
+            pass
+
+        def wait_library_scan(self, _timeout: int, _poll: int) -> bool:
+            return True
+
+        def theme_visible(self, _item_id: str) -> bool:
+            return False
+
+    worker = object.__new__(Worker)
+    worker.config = config
+    worker.db = db
+    worker.emby = FakeEmby()
+    status, completed = worker._register_pending()
+    state = db.item_state(media.id)
+    assert status == "complete"
+    assert completed == 0
+    assert state and state["status"] == "failed" and state["last_error_class"] == "registration"
+    assert db.pending_item_ids() == []
+    assert not db.is_due(media.id)
+
+
+def test_item_refresh_timeout_does_not_abort_registration() -> None:
+    class TimeoutClient:
+        def post(self, *_args: object, **_kwargs: object) -> object:
+            raise httpx.ReadTimeout("timed out")
+
+    client = object.__new__(EmbyClient)
+    client.client = TimeoutClient()
+    assert client.refresh_and_verify("1") is False

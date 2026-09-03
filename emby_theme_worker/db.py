@@ -173,6 +173,16 @@ class StateDB:
         with self.connect() as conn:
             return [str(row["emby_id"]) for row in conn.execute("SELECT emby_id FROM items WHERE status='pending_refresh' ORDER BY updated_at")]
 
+    def record_registration_failure(self, item_id: str, retry_after: str) -> None:
+        """Keep an unindexed output auditable without blocking bootstrap forever."""
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE items SET status='failed',last_error_class='registration',"
+                "last_error='theme not visible after item refresh and library scan',"
+                "failure_count=failure_count+1,retry_after=?,updated_at=? WHERE emby_id=?",
+                (retry_after, now(), item_id),
+            )
+
     def run_active(self) -> bool:
         with self.connect() as conn:
             row = conn.execute("SELECT 1 FROM runs WHERE status='running' ORDER BY id DESC LIMIT 1").fetchone()

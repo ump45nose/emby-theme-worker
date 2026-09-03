@@ -52,6 +52,7 @@ class Config:
     backoff: dict[str, int] = field(default_factory=lambda: {
         "not_found_days": 30,
         "low_score_days": 7,
+        "registration_days": 7,
         "network_hours": 6,
     })
 
