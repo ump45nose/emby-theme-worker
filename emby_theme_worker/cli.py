@@ -94,7 +94,7 @@ def doctor(config: Config, db: StateDB) -> dict:
         "path": str(allowed),
         "adult_mounted": Path("/Adult").exists(),
     }
-    for binary in ("ffmpeg", "ffprobe"):
+    for binary in ("ffmpeg", "ffprobe", "deno"):
         path = shutil.which(binary)
         checks[binary] = {"ok": bool(path), "path": path}
     try:
