@@ -45,6 +45,8 @@ def _base(socket_timeout_seconds: int) -> list[str]:
         "--quiet",
         "--no-warnings",
         "--no-progress",
+        "--js-runtimes",
+        "node",
         "--socket-timeout",
         str(min(socket_timeout_seconds, 15)),
         "--retries",
