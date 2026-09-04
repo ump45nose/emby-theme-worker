@@ -3,7 +3,7 @@ emby_api_key_file: /run/secrets/emby_api_key
 allowed_path: /Media
 database_path: /data/worker.db
 timezone: Asia/Taipei
-schedule: "0 3 * * *"
+schedule: "30 9 * * *"
 target_seconds: 45
 output_bitrate: 192k
 
@@ -21,7 +21,6 @@ providers:
     - plex_tv
     - archive
     - televisiontunes
-    - tunefind
     - youtube
     - bilibili
     - netease
@@ -29,7 +28,8 @@ providers:
   timeout_seconds: 30
   ytdlp_search_timeout_seconds: 60
   ytdlp_download_timeout_seconds: 180
-  threshold: 75
+  threshold: 80
+  replacement_threshold: 85
   cookies:
     youtube: /run/secrets/youtube.cookies.txt
     bilibili: /run/secrets/bilibili.cookies.txt
@@ -46,3 +46,10 @@ refresh:
   full_scan_after_scheduled_run: true
   library_scan_timeout_seconds: 7200
   task_poll_seconds: 10
+
+replacement_backup_path: /data/replaced-themes
+intro_library_ids:
+  - "136475"
+  - "136459"
+  - "5"
+  - "146900"

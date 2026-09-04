@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import statistics
 from pathlib import Path
 from typing import Iterator
 
@@ -42,7 +43,7 @@ class EmbyClient:
     def get_item(self, item_id: str) -> MediaItem:
         payload = self.client.get(
             "/Items",
-            params={"Ids": item_id, "Recursive": True, "Fields": "Path,ProviderIds,Genres,OriginalTitle"},
+            params={"Ids": item_id, "Recursive": True, "Fields": "Path,ProviderIds,Genres,OriginalTitle,ProductionYear"},
         ).raise_for_status().json()
         rows = payload.get("Items", [])
         if not rows:
@@ -62,7 +63,7 @@ class EmbyClient:
                 "Recursive": True,
                 "IncludeItemTypes": "Movie,Series",
                 "HasThemeSong": has_theme,
-                "Fields": "Path,ProviderIds,Genres,OriginalTitle",
+                "Fields": "Path,ProviderIds,Genres,OriginalTitle,ProductionYear",
                 "StartIndex": start,
                 "Limit": page_size,
                 "SortBy": "SortName",
@@ -73,7 +74,7 @@ class EmbyClient:
             batch = payload.get("Items", [])
             for raw in batch:
                 item = self._to_item(raw)
-                if item.path and contained(item.path, self.allowed_path):
+                if item.path and contained(item.path, self.allowed_path) and (item.provider_ids or item.year):
                     yield item
             start += len(batch)
             if not batch or start >= int(payload.get("TotalRecordCount", start)):
@@ -108,6 +109,108 @@ class EmbyClient:
             if path and contained(path, self.allowed_path):
                 return path
         return None
+
+    def intro_candidates(self, series_id: str) -> list[dict]:
+        params = {
+            "ParentId": series_id, "Recursive": True, "IncludeItemTypes": "Episode",
+            "Fields": "Path,Chapters,ParentIndexNumber", "SortBy": "SortName", "SortOrder": "Ascending",
+            "IsMissing": False, "Limit": 10000,
+        }
+        found: list[dict] = []
+        for raw in self.client.get("/Items", params=params).raise_for_status().json().get("Items", []):
+            if int(raw.get("ParentIndexNumber") or 0) == 0:
+                continue
+            path = raw.get("Path") or ""
+            if not path or not contained(path, self.allowed_path):
+                continue
+            markers = {str(ch.get("MarkerType")): ch for ch in raw.get("Chapters") or [] if ch.get("MarkerType")}
+            start = markers.get("IntroStart")
+            end = markers.get("IntroEnd")
+            if not start or not end:
+                continue
+            start_seconds = float(start.get("StartPositionTicks") or 0) / 10_000_000
+            end_seconds = float(end.get("StartPositionTicks") or 0) / 10_000_000
+            duration = end_seconds - start_seconds
+            if duration <= 0:
+                continue
+            found.append({"episode_id": str(raw["Id"]), "path": path, "start": start_seconds, "end": end_seconds, "duration": duration})
+        return found
+
+    def representative_intro(self, series_id: str) -> dict | None:
+        candidates = [row for row in self.intro_candidates(series_id) if row["duration"] >= 30]
+        if not candidates:
+            return None
+        median = statistics.median(row["duration"] for row in candidates)
+        return min(candidates, key=lambda row: abs(row["duration"] - median))
+
+    def virtual_folder(self, library_id: str) -> dict:
+        for folder in self.client.get("/Library/VirtualFolders").raise_for_status().json():
+            if str(folder.get("ItemId") or "") == str(library_id):
+                locations = folder.get("Locations") or []
+                if not locations or not all(contained(path, self.allowed_path) for path in locations):
+                    raise ValueError("library is outside allowed path")
+                return folder
+        raise ValueError(f"library {library_id} was not found")
+
+    def enable_intro_detection(self, library_id: str) -> dict:
+        folder = self.virtual_folder(library_id)
+        options = dict(folder.get("LibraryOptions") or {})
+        options["EnableMarkerDetection"] = True
+        options["EnableMarkerDetectionDuringLibraryScan"] = False
+        self.client.post("/Library/VirtualFolders/LibraryOptions", json={"Id": str(library_id), "LibraryOptions": options}).raise_for_status()
+        updated = self.virtual_folder(library_id)
+        updated_options = updated.get("LibraryOptions") or {}
+        if not updated_options.get("EnableMarkerDetection") or updated_options.get("EnableMarkerDetectionDuringLibraryScan"):
+            raise RuntimeError("intro detection settings did not read back")
+        return updated
+
+    def intro_status(self, library_id: str) -> dict:
+        self.virtual_folder(library_id)
+        params = {"ParentId": library_id, "Recursive": True, "IncludeItemTypes": "Episode", "Fields": "Chapters,SeriesId", "Limit": 10000}
+        rows = self.client.get("/Items", params=params).raise_for_status().json().get("Items", [])
+        marked = 0
+        series: set[str] = set()
+        durations: list[float] = []
+        for raw in rows:
+            markers = {str(ch.get("MarkerType")): ch for ch in raw.get("Chapters") or [] if ch.get("MarkerType")}
+            if "IntroStart" in markers and "IntroEnd" in markers:
+                start = float(markers["IntroStart"].get("StartPositionTicks") or 0) / 10_000_000
+                end = float(markers["IntroEnd"].get("StartPositionTicks") or 0) / 10_000_000
+                if end > start:
+                    marked += 1
+                    durations.append(end - start)
+                    if raw.get("SeriesId"):
+                        series.add(str(raw["SeriesId"]))
+        return {
+            "library_id": str(library_id), "episodes": len(rows), "marked_episodes": marked,
+            "marked_series": len(series), "coverage_pct": round(marked * 100 / len(rows), 2) if rows else 0,
+            "duration_min": min(durations) if durations else None,
+            "duration_max": max(durations) if durations else None,
+            "duration_median": statistics.median(durations) if durations else None,
+        }
+
+    def run_task(self, key: str, timeout_seconds: int, poll_seconds: int) -> dict:
+        tasks = self.client.get("/ScheduledTasks").raise_for_status().json()
+        task = next((row for row in tasks if row.get("Key") == key), None)
+        if not task:
+            raise ValueError(f"scheduled task {key} not found")
+        task_id = str(task["Id"])
+        previous_start = ((task.get("LastExecutionResult") or {}).get("StartTimeUtc"))
+        self.client.post(f"/ScheduledTasks/Running/{task_id}").raise_for_status()
+        deadline = time.monotonic() + timeout_seconds
+        seen_running = False
+        while time.monotonic() < deadline:
+            current = next((row for row in self.client.get("/ScheduledTasks").raise_for_status().json() if str(row.get("Id")) == task_id), None)
+            if current and current.get("State") == "Running":
+                seen_running = True
+            elif seen_running or ((current or {}).get("LastExecutionResult") or {}).get("StartTimeUtc") != previous_start:
+                result = current.get("LastExecutionResult") if current else None
+                status = (result or {}).get("Status")
+                if status not in {"Completed", "CompletedWithError"}:
+                    raise RuntimeError(f"scheduled task {key} ended with {status or 'unknown'}")
+                return {"key": key, "id": task_id, "status": status}
+            time.sleep(poll_seconds)
+        raise TimeoutError(f"scheduled task {key} did not finish")
 
     def refresh_and_verify(self, item_id: str, attempts: int = 8, delay: float = 2.0) -> bool:
         common = {"Recursive": False, "ImageRefreshMode": "Default", "ReplaceAllImages": False, "ReplaceAllMetadata": False}

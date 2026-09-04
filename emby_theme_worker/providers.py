@@ -18,6 +18,14 @@ LOG = logging.getLogger(__name__)
 UA = "emby-theme-worker/0.1 (+private-home-instance)"
 
 
+class ProviderBlocked(RuntimeError):
+    pass
+
+
+class ProviderParserError(RuntimeError):
+    pass
+
+
 class Providers:
     def __init__(
         self,
@@ -40,33 +48,39 @@ class Providers:
         self.http.close()
 
     def _enabled(self, name: str) -> bool:
-        return name in self.enabled and self.db.provider_available(name)
+        return name in self.enabled and self.db.provider_available("resolver", name)
 
     def exact(self, item: MediaItem) -> list[Candidate]:
         order: list[tuple[str, object]] = []
+        found: list[Candidate] = []
         if item.is_anime:
             order.append(("animethemes", self.animethemes))
         order.append(("themerrdb", self.themerrdb))
         if item.item_type == "Series":
             order.append(("plex_tv", self.plex_tv))
+            order.append(("televisiontunes", self.televisiontunes))
         for name, method in order:
             if not self._enabled(name):
                 continue
             try:
                 candidate = method(item)  # type: ignore[operator]
                 if candidate:
-                    return [candidate]
-                self.db.provider_success(name)
+                    if isinstance(candidate, list):
+                        results = candidate
+                    else:
+                        results = [candidate]
+                    self.db.provider_success("resolver", name)
+                    found.extend(results)
+                else:
+                    self.db.provider_success("resolver", name)
             except Exception as exc:
                 LOG.warning("exact provider %s failed: %s", name, exc.__class__.__name__)
-                self.db.provider_failure(name, exc.__class__.__name__)
-        return []
+                self.db.provider_failure("resolver", name, exc.__class__.__name__)
+        return found
 
     def fuzzy(self, item: MediaItem) -> list[Candidate]:
         methods = {
             "archive": self.archive,
-            "televisiontunes": self.televisiontunes,
-            "tunefind": self.tunefind,
             "youtube": self.youtube,
             "bilibili": self.bilibili,
             "netease": self.netease,
@@ -74,8 +88,6 @@ class Providers:
         }
         results: list[Candidate] = []
         selected = {name: fn for name, fn in methods.items() if self._enabled(name)}
-        if item.item_type != "Series":
-            selected.pop("televisiontunes", None)
         with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
             futures = {pool.submit(fn, item): name for name, fn in selected.items()}
             for future in as_completed(futures):
@@ -83,14 +95,10 @@ class Providers:
                 try:
                     found = future.result()
                     results.extend(found)
-                    # A non-empty search result is only discovery success. Keep
-                    # prior transport failures until a candidate is downloaded
-                    # and committed; otherwise every search masks yt-dlp faults.
-                    if not found:
-                        self.db.provider_success(name)
+                    self.db.provider_success("resolver", name)
                 except Exception as exc:  # providers are isolated by design
                     LOG.warning("provider %s failed: %s", name, exc.__class__.__name__)
-                    self.db.provider_failure(name, exc.__class__.__name__)
+                    self.db.provider_failure("resolver", name, exc.__class__.__name__)
         return results
 
     def animethemes(self, item: MediaItem) -> Candidate | None:
@@ -130,7 +138,7 @@ class Providers:
                     for video in (entry.get("videos") or {}).get("nodes", []):
                         source = (video.get("audio") or {}).get("link") or video.get("link")
                         if source:
-                            return Candidate("animethemes", f"{query_text} OP1", source, exact=True, year=anime.get("year"), media_type="Series")
+                            return Candidate("animethemes", f"{query_text} OP1", source, exact=True, year=anime.get("year"), media_type="Series", transport="direct_http")
         return None
 
     def themerrdb(self, item: MediaItem) -> Candidate | None:
@@ -150,6 +158,7 @@ class Providers:
             "themerrdb", f"{item.original_title or item.name} main theme", source,
             exact=True, year=item.year, media_type=item.item_type,
             metadata={"transport": "youtube/yt-dlp"},
+            transport="youtube",
         )
 
     def plex_tv(self, item: MediaItem) -> Candidate | None:
@@ -163,7 +172,7 @@ class Providers:
         response.raise_for_status()
         if "audio" not in response.headers.get("content-type", ""):
             return None
-        return Candidate("plex_tv", f"{item.original_title or item.name} TV theme", url, exact=True, year=item.year, media_type="Series")
+        return Candidate("plex_tv", f"{item.original_title or item.name} TV theme", url, exact=True, year=item.year, media_type="Series", transport="direct_http")
 
     def _query(self, item: MediaItem) -> str:
         title = item.original_title or item.name
@@ -195,23 +204,50 @@ class Providers:
             if not media_file:
                 continue
             source = f"https://archive.org/download/{quote(str(identifier))}/{quote(str(media_file['name']))}"
-            found.append(Candidate("archive", str(doc.get("title") or identifier), source, year=_year(doc.get("year")), metadata={"license": rights[:200]}))
+            found.append(Candidate("archive", str(doc.get("title") or identifier), source, year=_year(doc.get("year")), metadata={"license": rights[:200]}, transport="direct_http"))
         return found
 
     def televisiontunes(self, item: MediaItem) -> list[Candidate]:
-        response = self.http.get("https://www.televisiontunes.com/search.php", params={"q": item.original_title or item.name})
-        if response.status_code >= 400:
-            return []
-        links = re.findall(r'href=["\']([^"\']+\.mp3[^"\']*)["\']', response.text, re.I)
-        return [Candidate("televisiontunes", f"{item.original_title or item.name} television theme", urljoin(str(response.url), link)) for link in links[:5]]
+        query = item.original_title or item.name
+        response = self.http.get("https://www.televisiontunes.co.uk/", params={"s": query})
+        self._usable_html(response)
+        expected = normalize(query)
+        links: list[str] = []
+        for href, label in re.findall(r'href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', response.text, re.I | re.S):
+            url = urljoin(str(response.url), href)
+            if "televisiontunes.co.uk/" not in url or "/themes/" in url or "/search/" in url:
+                continue
+            label_text = normalize(re.sub(r"<[^>]+>", " ", unescape(label)))
+            slug_text = normalize(url.rstrip("/").rsplit("/", 1)[-1].replace("-", " "))
+            if expected and expected in {label_text, slug_text} and url not in links:
+                links.append(url)
+        found: list[Candidate] = []
+        for detail_url in links[:5]:
+            detail = self.http.get(detail_url)
+            self._usable_html(detail)
+            audio = re.findall(r'contentUrl["\']?\s*:\s*["\']([^"\']+)', detail.text, re.I)
+            if not audio:
+                audio = re.findall(r'<source[^>]+src=["\']([^"\']+)', detail.text, re.I)
+            for source in audio[:1]:
+                found.append(Candidate(
+                    "televisiontunes", f"{query} television theme", urljoin(str(detail.url), unescape(source)),
+                    exact=True, year=item.year, media_type="Series", transport="direct_http",
+                ))
+        if links and not found:
+            raise ProviderParserError("matching detail page contained no audio URL")
+        return found
+
+    @staticmethod
+    def _usable_html(response: httpx.Response) -> None:
+        if response.status_code in {401, 403, 429}:
+            raise ProviderBlocked(f"HTTP {response.status_code}")
+        response.raise_for_status()
+        lowered = response.text.casefold()
+        if "just a moment" in lowered or "cf-chl-" in lowered:
+            raise ProviderBlocked("anti-bot challenge")
 
     def tunefind(self, item: MediaItem) -> list[Candidate]:
-        response = self.http.get("https://www.tunefind.com/search/site", params={"q": item.original_title or item.name})
-        if response.status_code >= 400:
-            return []
-        text = re.sub(r"<[^>]+>", " ", response.text)
-        titles = [unescape(t).strip() for t in re.findall(r"([\w\s'’:&.-]{4,80}(?:Theme|Soundtrack|Opening|Main Title)[\w\s'’:&.-]{0,80})", text, re.I)]
-        return [Candidate("tunefind", title, f"ytsearch1:{title}", metadata={"search_only": True}) for title in titles[:5]]
+        raise ProviderBlocked("official Tunefind API credentials are required")
 
     def _ytdlp_search(self, provider: str, prefix: str, item: MediaItem) -> list[Candidate]:
         cookie = self.cookies.get(provider)
@@ -231,7 +267,7 @@ class Providers:
             if source:
                 candidates.append(Candidate(
                     provider, entry.get("title") or self._query(item), str(source),
-                    duration=entry.get("duration"), metadata={"transport": f"{provider}/yt-dlp"},
+                    duration=entry.get("duration"), metadata={"transport": f"{provider}/yt-dlp"}, transport=provider,
                 ))
         return candidates
 
@@ -256,7 +292,7 @@ class Providers:
                 "netease", f"{row.get('name','')} - {'/'.join(a.get('name','') for a in row.get('artists',[]))}",
                 f"https://music.163.com/#/song?id={row.get('id')}",
                 duration=(row.get("duration") or 0) / 1000,
-                metadata={"catalog_id": str(row.get("id", "")), "transport": "netease/yt-dlp"},
+                metadata={"catalog_id": str(row.get("id", "")), "transport": "netease/yt-dlp"}, transport="netease",
             )
             for row in rows if row.get("id")
         ]
@@ -270,7 +306,7 @@ class Providers:
                 "qqmusic", f"{row.get('songname','')} - {'/'.join(a.get('name','') for a in row.get('singer',[]))}",
                 f"https://y.qq.com/n/ryqq/songDetail/{row.get('songmid')}",
                 duration=row.get("interval"),
-                metadata={"catalog_id": row.get("songmid"), "transport": "qqmusic/yt-dlp"},
+                metadata={"catalog_id": row.get("songmid"), "transport": "qqmusic/yt-dlp"}, transport="qqmusic",
             )
             for row in rows if row.get("songmid")
         ]

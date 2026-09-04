@@ -20,12 +20,13 @@ class Limits:
 class ProviderSettings:
     enabled: list[str] = field(default_factory=lambda: [
         "animethemes", "themerrdb", "plex_tv", "archive", "televisiontunes",
-        "tunefind", "youtube", "bilibili", "netease", "qqmusic",
+        "youtube", "bilibili", "netease", "qqmusic",
     ])
     timeout_seconds: int = 30
     ytdlp_search_timeout_seconds: int = 60
     ytdlp_download_timeout_seconds: int = 180
-    threshold: int = 75
+    threshold: int = 80
+    replacement_threshold: int = 85
     cookies: dict[str, str] = field(default_factory=dict)
 
 
@@ -43,7 +44,9 @@ class Config:
     allowed_path: str = "/Media"
     database_path: str = "/data/worker.db"
     timezone: str = "Asia/Taipei"
-    schedule: str = "0 3 * * *"
+    schedule: str = "30 9 * * *"
+    replacement_backup_path: str = "/data/replaced-themes"
+    intro_library_ids: list[str] = field(default_factory=lambda: ["136475", "136459", "5", "146900"])
     target_seconds: int = 45
     output_bitrate: str = "192k"
     limits: Limits = field(default_factory=Limits)
@@ -75,6 +78,8 @@ class Config:
             raise ValueError("target_seconds must be between 15 and 180")
         if not 0 <= self.providers.threshold <= 100:
             raise ValueError("providers.threshold must be between 0 and 100")
+        if not self.providers.threshold <= self.providers.replacement_threshold <= 100:
+            raise ValueError("providers.replacement_threshold must be between threshold and 100")
         if self.providers.ytdlp_search_timeout_seconds < 5:
             raise ValueError("providers.ytdlp_search_timeout_seconds must be at least 5")
         if self.providers.ytdlp_download_timeout_seconds < 15:

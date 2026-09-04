@@ -60,14 +60,25 @@ class Worker:
             "emby_theme_count": emby_theme_count,
             "unindexed_disk_theme_count": disk_theme_skips,
             "provider_routes": {
-                "anime": ["animethemes", "themerrdb", "plex_tv", "fuzzy", "local_opening"],
-                "series": ["themerrdb", "plex_tv", "fuzzy", "local_opening"],
-                "movie": ["themerrdb", "fuzzy", "local_opening"],
+                "anime": ["animethemes", "themerrdb", "plex_tv", "televisiontunes", "fuzzy", "intro_markers"],
+                "series": ["themerrdb", "plex_tv", "televisiontunes", "fuzzy", "intro_markers"],
+                "movie": ["themerrdb", "fuzzy"],
             },
             "items": [
                 {"id": item.id, "name": item.name, "type": item.item_type, "year": item.year, "anime": item.is_anime}
                 for item in eligible
             ],
+        }
+
+    def probe(self, item_id: str) -> dict:
+        item = self.emby.get_item(item_id)
+        exact = self._resolve_exact(item)
+        fuzzy = [] if exact else self._resolve_fuzzy(item)
+        return {
+            "item": {"id": item.id, "name": item.name, "type": item.item_type, "year": item.year},
+            "exact": [candidate.public_dict() for candidate in exact],
+            "fuzzy": [candidate.public_dict() for candidate in fuzzy],
+            "eligible": [candidate.public_dict() for candidate in exact + fuzzy if candidate.exact or candidate.score >= self.config.providers.threshold],
         }
 
     def run(self, *, item_id: str | None = None, limit: int | None = None) -> dict:
@@ -148,7 +159,7 @@ class Worker:
                 # item's documented Default -> FullRefresh route before adding
                 # it to another (expensive) library-wide scan.
                 if self.emby.refresh_and_verify(item.id):
-                    self.db.provider_success(state.get("source_provider") or "local_opening")
+                    self.db.provider_success("resolver", state.get("source_provider") or "local_opening")
                     self.db.record_item(
                         item, "complete", provider=state.get("source_provider"), score=state.get("score"),
                         output_path=str(target), output_sha256=state["output_sha256"],
@@ -163,10 +174,7 @@ class Worker:
             return {"item_id": item.id, "status": "skipped_existing_unindexed"}
 
         errors: list[str] = []
-        exact = self.providers.exact(item)
-        for candidate in exact:
-            candidate.score = 100
-        self._record_candidates(item, exact)
+        exact = self._resolve_exact(item)
         result = self._try_candidates(item, exact, errors, route="exact")
         if result:
             return result
@@ -175,8 +183,7 @@ class Worker:
         # guarantee that the referenced transport (usually YouTube) is usable.
         # Search the independent providers after a transport failure instead of
         # skipping directly to local opening extraction.
-        fuzzy = score_all(self.providers.fuzzy(item), item)
-        self._record_candidates(item, fuzzy)
+        fuzzy = self._resolve_fuzzy(item)
         eligible = [candidate for candidate in fuzzy if candidate.score >= self.config.providers.threshold]
         result = self._try_candidates(item, eligible, errors, route="fuzzy")
         if result:
@@ -205,6 +212,21 @@ class Worker:
             url_hash = hashlib.sha256(candidate.source_url.encode()).hexdigest()
             self.db.record_candidate(item.id, candidate, url_hash)
 
+    def _resolve(self, item: MediaItem) -> tuple[list[Candidate], list[Candidate]]:
+        return self._resolve_exact(item), self._resolve_fuzzy(item)
+
+    def _resolve_exact(self, item: MediaItem) -> list[Candidate]:
+        exact = self.providers.exact(item)
+        for candidate in exact:
+            candidate.score = 100
+        self._record_candidates(item, exact)
+        return exact
+
+    def _resolve_fuzzy(self, item: MediaItem) -> list[Candidate]:
+        fuzzy = score_all(self.providers.fuzzy(item), item)
+        self._record_candidates(item, fuzzy)
+        return fuzzy
+
     def _try_candidates(
         self,
         item: MediaItem,
@@ -214,7 +236,10 @@ class Worker:
         route: str,
     ) -> dict | None:
         for candidate in candidates:
-            transport = str(candidate.metadata.get("transport") or "direct")
+            transport = candidate.transport or "direct_http"
+            if not self.db.provider_available("transport", transport):
+                errors.append(f"{transport}:CircuitOpen")
+                continue
             LOG.info(
                 "candidate attempt item=%s route=%s provider=%s transport=%s score=%s",
                 item.id, route, candidate.provider, transport, candidate.score,
@@ -222,8 +247,8 @@ class Worker:
             try:
                 return self._from_candidate(item, candidate)
             except Exception as exc:
-                errors.append(f"{candidate.provider}:{exc.__class__.__name__}")
-                self.db.provider_failure(candidate.provider, exc.__class__.__name__)
+                errors.append(f"{transport}:{exc.__class__.__name__}")
+                self.db.provider_failure("transport", transport, exc.__class__.__name__)
                 LOG.warning(
                     "candidate failed item=%s route=%s provider=%s transport=%s error=%s",
                     item.id, route, candidate.provider, transport, exc.__class__.__name__,
@@ -237,19 +262,21 @@ class Worker:
             prepared = workdir / "prepared.mp3"
             self.audio.normalize_online(source, prepared)
             info = self.audio.validate(prepared)
-            return self._commit(item, prepared, candidate.provider, candidate.score, info)
+            return self._commit(item, prepared, candidate.resolver or candidate.provider, candidate.transport or "direct_http", candidate.score, info)
 
     def _from_local(self, item: MediaItem) -> dict:
-        media_path = item.path if item.item_type == "Movie" else self.emby.earliest_episode_media(item.id)
-        if not media_path:
-            raise FileNotFoundError("no local media for opening extraction")
+        if item.item_type == "Movie":
+            raise ValueError("movie local extraction is disabled")
+        intro = self.emby.representative_intro(item.id)
+        if not intro:
+            raise FileNotFoundError("no valid IntroStart/IntroEnd markers")
         with temporary_directory() as work:
             prepared = Path(work) / "prepared.mp3"
-            self.audio.extract_opening(media_path, prepared)
-            info = self.audio.validate(prepared)
-            return self._commit(item, prepared, "local_opening", 0, info)
+            self.audio.extract_intro(intro["path"], prepared, intro["start"], intro["end"])
+            info = self.audio.validate(prepared, min_duration=28, max_duration=62)
+            return self._commit(item, prepared, "intro_markers", "local_media", 85, info)
 
-    def _commit(self, item: MediaItem, prepared: Path, provider: str, score: int, info: dict) -> dict:
+    def _commit(self, item: MediaItem, prepared: Path, provider: str, transport: str, score: int, info: dict) -> dict:
         if self.emby.theme_visible(item.id):
             self.db.record_item(item, "skipped_existing")
             return {"item_id": item.id, "status": "skipped_existing"}
@@ -259,13 +286,99 @@ class Worker:
             return {"item_id": item.id, "status": "skipped_existing"}
         if self.db.get_meta("theme_registration_mode") != "full_scan":
             if self.emby.refresh_and_verify(item.id):
-                self.db.provider_success(provider)
+                self.db.provider_success("resolver", provider)
+                self.db.provider_success("transport", transport)
                 self.db.record_item(item, "complete", provider=provider, score=score, output_path=str(target), output_sha256=digest)
                 return {"item_id": item.id, "status": "complete", "provider": provider, "score": score, "path": str(target), "sha256": digest, "duration": info["duration"]}
             self.db.set_meta("theme_registration_mode", "full_scan")
-        self.db.provider_success(provider)
+        self.db.provider_success("resolver", provider)
+        self.db.provider_success("transport", transport)
         self.db.record_item(item, "pending_refresh", provider=provider, score=score, output_path=str(target), output_sha256=digest)
         return {"item_id": item.id, "status": "pending_refresh", "provider": provider, "score": score, "path": str(target), "sha256": digest, "duration": info["duration"]}
+
+    def migrate_local(self, *, dry_run: bool, item_type: str | None = None, limit: int = 25, item_id: str | None = None) -> dict:
+        if item_id:
+            state = self.db.item_state(item_id)
+            rows = [state] if state and state.get("source_provider") == "local_opening" else []
+        else:
+            rows = self.db.local_opening_items(item_type)[:limit]
+        results: list[dict] = []
+        for state in rows:
+            try:
+                item = self.emby.get_item(str(state["emby_id"]))
+                target = item.directory / "theme.mp3"
+                expected = str(state["output_sha256"])
+                if not target.exists() or sha256(target) != expected:
+                    results.append({"item_id": item.id, "status": "changed_or_missing"})
+                    self.db.defer_local_migration(item.id)
+                    continue
+                exact = self._resolve_exact(item)
+                if dry_run:
+                    fuzzy = [] if exact else self._resolve_fuzzy(item)
+                    candidates = exact + [c for c in fuzzy if c.score >= self.config.providers.replacement_threshold]
+                    if candidates:
+                        results.append({"item_id": item.id, "name": item.name, "status": "ready", "candidate": candidates[0].public_dict()})
+                    else:
+                        results.append({"item_id": item.id, "status": "no_better_candidate"})
+                        self.db.defer_local_migration(item.id)
+                    continue
+                errors: list[str] = []
+                completed = self._try_replacement_candidates(item, state, exact, errors, "exact")
+                if not completed:
+                    fuzzy = [c for c in self._resolve_fuzzy(item) if c.score >= self.config.providers.replacement_threshold]
+                    completed = self._try_replacement_candidates(item, state, fuzzy, errors, "fuzzy")
+                if completed:
+                    results.append(completed)
+                else:
+                    results.append({"item_id": item.id, "status": "failed", "errors": errors})
+                    self.db.defer_local_migration(item.id)
+            except Exception as exc:
+                results.append({"item_id": str(state["emby_id"]), "status": "failed", "error": exc.__class__.__name__})
+                self.db.defer_local_migration(str(state["emby_id"]))
+        return {"dry_run": dry_run, "attempted": len(rows), "results": results}
+
+    def _try_replacement_candidates(self, item: MediaItem, state: dict, candidates: list[Candidate], errors: list[str], route: str) -> dict | None:
+        for candidate in candidates:
+            transport = candidate.transport or "direct_http"
+            if not self.db.provider_available("transport", transport):
+                errors.append(f"{route}:{transport}:CircuitOpen")
+                continue
+            try:
+                return self._replace_local(item, state, candidate)
+            except Exception as exc:
+                self.db.provider_failure("transport", transport, exc.__class__.__name__)
+                errors.append(f"{route}:{transport}:{exc.__class__.__name__}")
+        return None
+
+    def _replace_local(self, item: MediaItem, state: dict, candidate: Candidate) -> dict:
+        expected = str(state["output_sha256"])
+        replacement_id = self.db.start_replacement(item.id, candidate, expected, candidate.score)
+        target = item.directory / "theme.mp3"
+        backup = Path(self.config.replacement_backup_path) / item.id / f"{expected}.mp3"
+        replaced = False
+        try:
+            with temporary_directory() as work:
+                workdir = Path(work)
+                source = self.audio.fetch_candidate(candidate, workdir)
+                prepared = workdir / "prepared.mp3"
+                self.audio.normalize_online(source, prepared)
+                info = self.audio.validate(prepared)
+                digest, backup_path = self.audio.atomic_replace_owned(prepared, target, expected, backup)
+                replaced = True
+            if not self.emby.refresh_and_verify(item.id):
+                raise RuntimeError("replacement not visible through ThemeSongs")
+            provider = candidate.resolver or candidate.provider
+            transport = candidate.transport or "direct_http"
+            self.db.provider_success("resolver", provider)
+            self.db.provider_success("transport", transport)
+            self.db.record_item(item, "complete", provider=provider, score=candidate.score, output_path=str(target), output_sha256=digest)
+            self.db.finish_replacement(replacement_id, "complete", new_sha256=digest, backup_path=backup_path)
+            return {"item_id": item.id, "status": "complete", "provider": provider, "transport": transport, "sha256": digest, "duration": info["duration"], "backup": backup_path}
+        except Exception as exc:
+            if replaced and backup.exists():
+                self.audio.restore_replacement(target, backup)
+            self.db.finish_replacement(replacement_id, "rolled_back" if replaced else "failed", backup_path=str(backup) if backup.exists() else None, error=exc.__class__.__name__)
+            raise
 
     def _register_pending(self) -> tuple[str, int]:
         pending = self.db.pending_item_ids()

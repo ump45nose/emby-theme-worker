@@ -41,11 +41,11 @@ def score_candidate(candidate: Candidate, item: MediaItem, consensus: int = 1) -
     score = round(title_score * 0.45)
     if item.year and candidate.year:
         score += 10 if abs(item.year - candidate.year) <= 1 else -15
-    if not candidate.media_type or candidate.media_type.casefold() == item.item_type.casefold():
+    if candidate.media_type and candidate.media_type.casefold() == item.item_type.casefold():
         score += 5
     if POSITIVE.search(candidate.title):
         score += 15
-    if candidate.duration is None or 30 <= candidate.duration <= 600:
+    if candidate.duration is not None and 30 <= candidate.duration <= 600:
         score += 10
     score += min(15, max(0, consensus - 1) * 5)
     lowered = candidate.title.casefold()

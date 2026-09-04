@@ -13,6 +13,7 @@ from emby_theme_worker.config import Config
 from emby_theme_worker.db import StateDB
 from emby_theme_worker.emby import EmbyClient
 from emby_theme_worker.models import Candidate, MediaItem
+from emby_theme_worker.providers import Providers
 from emby_theme_worker.scoring import score_candidate
 from emby_theme_worker.security import RedactingFilter, contained, redact, safe_http_url_from_strm
 from emby_theme_worker.worker import Worker
@@ -62,6 +63,8 @@ def test_candidate_scoring() -> None:
     cover = Candidate("youtube", "Example Show 2025 Main Theme Cover Remix Live", "https://example.test/b", year=2025, media_type="Movie", duration=180)
     assert score_candidate(good, media) >= 75
     assert score_candidate(cover, media) < score_candidate(good, media)
+    incomplete = Candidate("youtube", "Example Show Main Theme", "https://example.test/c")
+    assert score_candidate(incomplete, media) < 80
 
 
 def test_strm_single_absolute_url() -> None:
@@ -85,6 +88,20 @@ def test_atomic_no_overwrite(tmp_path: Path) -> None:
     created, _, digest2 = processor.atomic_commit(second, target_dir)
     assert not created and target.read_bytes() == b"first" and digest2 == digest
     assert not (target_dir / ".theme.mp3.lock").exists()
+
+
+def test_atomic_owned_replacement_and_restore(tmp_path: Path) -> None:
+    processor = AudioProcessor(45, "192k", 30, {})
+    target = tmp_path / "theme.mp3"
+    prepared = tmp_path / "new.mp3"
+    backup = tmp_path / "backups" / "old.mp3"
+    target.write_bytes(b"old")
+    prepared.write_bytes(b"new")
+    new_hash, backup_path = processor.atomic_replace_owned(prepared, target, sha256(target), backup)
+    assert target.read_bytes() == b"new" and backup.read_bytes() == b"old"
+    assert new_hash == sha256(target) and backup_path == str(backup)
+    processor.restore_replacement(target, backup)
+    assert target.read_bytes() == b"old"
 
 
 def test_existing_theme_is_skipped(tmp_path: Path) -> None:
@@ -149,6 +166,51 @@ def test_exact_transport_failure_falls_back_to_fuzzy(tmp_path: Path) -> None:
     result = worker.process(media)
     assert result["provider"] == "archive"
     assert attempted == ["themerrdb", "archive"]
+
+
+def test_provider_health_isolated_by_stage(tmp_path: Path) -> None:
+    db = StateDB(str(tmp_path / "state.db"))
+    db.initialize()
+    for _ in range(3):
+        db.provider_failure("transport", "youtube", "Timeout")
+    assert not db.provider_available("transport", "youtube")
+    assert db.provider_available("resolver", "themerrdb")
+
+
+def test_exact_collects_all_resolvers(tmp_path: Path) -> None:
+    db = StateDB(str(tmp_path / "state.db"))
+    db.initialize()
+    providers = Providers(["themerrdb", "plex_tv", "televisiontunes"], 5, 1, db, {})
+    providers.themerrdb = lambda _item: Candidate("themerrdb", "a", "https://a", exact=True, transport="youtube")  # type: ignore[method-assign]
+    providers.plex_tv = lambda _item: Candidate("plex_tv", "b", "https://b", exact=True)  # type: ignore[method-assign]
+    providers.televisiontunes = lambda _item: [Candidate("televisiontunes", "c", "https://c", exact=True)]  # type: ignore[method-assign]
+    try:
+        assert [c.provider for c in providers.exact(item(tmp_path, "Series"))] == ["themerrdb", "plex_tv", "televisiontunes"]
+    finally:
+        providers.close()
+
+
+def test_televisiontunes_two_stage_parser(tmp_path: Path) -> None:
+    db = StateDB(str(tmp_path / "state.db"))
+    db.initialize()
+    providers = Providers(["televisiontunes"], 5, 1, db, {})
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/":
+            return httpx.Response(200, text='<a href="https://www.televisiontunes.co.uk/example-show">Example Show</a>')
+        return httpx.Response(200, text='{"contentUrl":"https://www.televisiontunes.co.uk/themes/Example.wav"}')
+    providers.http.close()
+    providers.http = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True)
+    try:
+        found = providers.televisiontunes(item(tmp_path, "Series"))
+        assert len(found) == 1 and found[0].exact and found[0].source_url.endswith("Example.wav")
+    finally:
+        providers.close()
+
+
+def test_movie_local_extraction_is_disabled(tmp_path: Path) -> None:
+    worker = object.__new__(Worker)
+    with pytest.raises(ValueError, match="disabled"):
+        worker._from_local(item(tmp_path, "Movie"))
 
 
 def test_unregistered_pending_output_becomes_registration_failure(tmp_path: Path) -> None:

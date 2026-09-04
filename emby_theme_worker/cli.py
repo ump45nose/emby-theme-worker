@@ -35,11 +35,26 @@ def parser() -> argparse.ArgumentParser:
     preview = commands.add_parser("preview")
     preview.add_argument("--json", action="store_true")
     preview.add_argument("--item")
+    probe = commands.add_parser("probe")
+    probe.add_argument("--item", required=True)
+    probe.add_argument("--json", action="store_true")
     run = commands.add_parser("run")
     run.add_argument("--item")
     run.add_argument("--limit", type=int)
     status = commands.add_parser("status")
     status.add_argument("--json", action="store_true")
+    migrate = commands.add_parser("migrate-local")
+    migrate.add_argument("--dry-run", action="store_true")
+    migrate.add_argument("--type", choices=("Movie", "Series"))
+    migrate.add_argument("--limit", type=int, default=25)
+    migrate.add_argument("--item")
+    intro = commands.add_parser("intro")
+    intro_commands = intro.add_subparsers(dest="intro_command", required=True)
+    for name in ("status", "enable", "run"):
+        child = intro_commands.add_parser(name)
+        child.add_argument("--library", required=True)
+        if name == "status":
+            child.add_argument("--json", action="store_true")
     commands.add_parser("health")
     commands.add_parser("serve")
     return root
@@ -151,6 +166,35 @@ def emit(payload: dict, json_output: bool = True) -> None:
             print(f"{key}: {value}")
 
 
+def emby_intro_status(worker: Worker, library_id: str) -> dict:
+    return worker.emby.intro_status(library_id)
+
+
+def enable_intro(worker: Worker, library_id: str) -> dict:
+    folder = worker.emby.virtual_folder(library_id)
+    backup_dir = Path(worker.config.database_path).parent / "library-options"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    backup = backup_dir / f"{library_id}-{stamp}.json"
+    backup.write_text(json.dumps(folder, ensure_ascii=False, indent=2), encoding="utf-8")
+    updated = worker.emby.enable_intro_detection(library_id)
+    return {
+        "library_id": library_id,
+        "name": updated.get("Name"),
+        "backup": str(backup),
+        "marker_detection": (updated.get("LibraryOptions") or {}).get("EnableMarkerDetection"),
+        "marker_during_scan": (updated.get("LibraryOptions") or {}).get("EnableMarkerDetectionDuringLibraryScan"),
+    }
+
+
+def run_intro(worker: Worker, library_id: str) -> dict:
+    worker.emby.virtual_folder(library_id)
+    tasks = []
+    for key in ("IntroFingerprintExtractTask", "markers"):
+        tasks.append(worker.emby.run_task(key, worker.config.refresh.library_scan_timeout_seconds, worker.config.refresh.task_poll_seconds))
+    return {"library_id": library_id, "tasks": tasks, "status": worker.emby.intro_status(library_id)}
+
+
 def main() -> None:
     args = parser().parse_args()
     configure_logging(args.verbose)
@@ -165,7 +209,13 @@ def main() -> None:
             emit(result)
             raise SystemExit(0 if result["ok"] else 1)
         if args.command == "status":
-            emit(db.status(), args.json)
+            result = db.status()
+            worker = make_worker(config, db)
+            try:
+                result["intro_libraries"] = [worker.emby.intro_status(library_id) for library_id in config.intro_library_ids]
+            finally:
+                worker.close()
+            emit(result, args.json)
             return
         if args.command == "serve":
             serve(config, db)
@@ -174,8 +224,19 @@ def main() -> None:
         try:
             if args.command == "preview":
                 emit(worker.preview(args.item), args.json)
+            elif args.command == "probe":
+                emit(worker.probe(args.item), args.json)
             elif args.command == "run":
                 emit(worker.run(item_id=args.item, limit=args.limit))
+            elif args.command == "migrate-local":
+                emit(worker.migrate_local(dry_run=args.dry_run, item_type=args.type, limit=args.limit, item_id=args.item))
+            elif args.command == "intro":
+                if args.intro_command == "status":
+                    emit(emby_intro_status(worker, args.library), args.json)
+                elif args.intro_command == "enable":
+                    emit(enable_intro(worker, args.library))
+                elif args.intro_command == "run":
+                    emit(run_intro(worker, args.library))
         finally:
             worker.close()
     except SystemExit:

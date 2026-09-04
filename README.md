@@ -7,7 +7,7 @@ Private, headless Python 3.12 worker that discovers missing Emby movie and serie
 - Enumerates `Movie` and `Series` items through the Emby API with pagination and `HasThemeSong=false`.
 - Restricts all work to a configured media root and checks both Emby `ThemeSongs` and the filesystem before writing.
 - Uses exact provider identifiers first, then scores concurrent fuzzy candidates on title, year/type, theme intent, duration, and cross-source consensus.
-- Extracts an opening from local media or a strictly validated single-URL STRM when online providers miss.
+- Never extracts a movie studio logo as a theme; series extraction requires Emby `IntroStart`/`IntroEnd` markers.
 - Selects the highest-energy 45-second window, normalizes loudness, adds short fades, and emits 192 kbps MP3.
 - Commits with a same-directory lock and atomic rename; existing themes are never overwritten.
 - Stores resumable state, backoff, provider circuits, candidate evidence, and output hashes in SQLite.
@@ -25,15 +25,17 @@ Private, headless Python 3.12 worker that discovers missing Emby movie and serie
 
 ## Provider pipeline
 
-Exact providers stop at the first valid match:
+Exact resolvers are collected in priority order and transport failures continue to the next candidate:
 
 | Media type | Exact order |
 | --- | --- |
-| Anime | AnimeThemes strict title/year OP1 -> ThemerrDB TMDb -> Plex TVDb theme |
-| Series | ThemerrDB TMDb -> Plex TVDb theme |
+| Anime | AnimeThemes strict title/year OP1 -> ThemerrDB TMDb -> Plex TVDb theme -> TelevisionTunes |
+| Series | ThemerrDB TMDb -> Plex TVDb theme -> TelevisionTunes |
 | Movie | ThemerrDB TMDb |
 
-If the exact layer misses, the worker queries Archive.org, TelevisionTunes, Tunefind, YouTube, Bilibili, NetEase, and QQ Music concurrently. Archive.org candidates require explicit Creative Commons or public-domain metadata.
+If the exact layer misses, the worker queries Archive.org, YouTube, Bilibili, NetEase, and QQ Music concurrently. Archive.org candidates require explicit Creative Commons or public-domain metadata. Anonymous Tunefind scraping is deliberately disabled; its official API adapter remains gated on issued credentials and documentation.
+
+Resolver health and transport health are separate. A valid ThemerrDB mapping whose YouTube download fails opens the YouTube transport circuit, not the ThemerrDB resolver circuit.
 
 Fuzzy candidates share a 100-point scorer with a default automatic threshold of 75. Covers, remixes, live performances, karaoke, trailers, reactions, and playlists receive penalties. The final fallback extracts the opening from the movie or earliest normal episode.
 
@@ -54,7 +56,7 @@ The supplied image pins Python 3.12, FFmpeg 7.1.5, yt-dlp 2026.8.19, and all Pyt
    ```bash
    gh repo clone ump45nose/emby-theme-worker
    cd emby-theme-worker
-   docker build --pull=false -t local/emby-theme-worker:0.1.4 .
+   docker build --pull=false -t local/emby-theme-worker:0.2.0 .
    ```
 
 2. Create persistent directories and copy the public configuration:
@@ -103,9 +105,22 @@ docker compose exec -T emby-theme-worker emby-theme-worker doctor
 docker compose exec -T emby-theme-worker emby-theme-worker preview --json
 docker compose exec -T emby-theme-worker emby-theme-worker preview --json --item 136511
 
+# Read-only provider resolution and scoring
+docker compose exec -T emby-theme-worker emby-theme-worker probe --item 136511 --json
+
 # Bounded manual work
 docker compose exec -T emby-theme-worker emby-theme-worker run --item 136511
 docker compose exec -T emby-theme-worker emby-theme-worker run --limit 10
+
+# Audit and safely replace worker-owned legacy local openings
+docker compose exec -T emby-theme-worker emby-theme-worker migrate-local --dry-run --type Movie --limit 25
+docker compose exec -T emby-theme-worker emby-theme-worker migrate-local --dry-run --item EMBY_ID
+docker compose exec -T emby-theme-worker emby-theme-worker migrate-local --type Movie --limit 1
+
+# Emby intro-marker pilot for a single library
+docker compose exec -T emby-theme-worker emby-theme-worker intro status --library 136475 --json
+docker compose exec -T emby-theme-worker emby-theme-worker intro enable --library 136475
+docker compose exec -T emby-theme-worker emby-theme-worker intro run --library 136475
 
 # Progress and health
 docker compose exec -T emby-theme-worker emby-theme-worker status --json
@@ -123,9 +138,10 @@ Public settings live in `config/config.yaml`:
 | `emby_url` | `http://127.0.0.1:28096` | Emby endpoint reachable through host networking |
 | `allowed_path` | `/Media` | Only eligible physical media root |
 | `database_path` | `/data/worker.db` | SQLite state database |
-| `schedule` | `0 3 * * *` | Cron schedule interpreted in `timezone` |
+| `schedule` | `30 9 * * *` | Cron schedule interpreted in `timezone`, after the fixed Emby downtime |
 | `target_seconds` | `45` | Output duration |
-| `providers.threshold` | `75` | Minimum fuzzy auto-selection score |
+| `providers.threshold` | `80` | Minimum fuzzy auto-selection score |
+| `providers.replacement_threshold` | `85` | Minimum score for replacing a worker-owned local opening |
 | `providers.ytdlp_search_timeout_seconds` | `60` | Hard wall-clock deadline for one yt-dlp search |
 | `providers.ytdlp_download_timeout_seconds` | `180` | Hard wall-clock deadline for one yt-dlp download |
 | `limits.network_concurrency` | `2` | Concurrent provider lookups |
@@ -168,7 +184,7 @@ To roll back, stop or recreate only this independent container with a retained i
 
 ```bash
 docker compose stop emby-theme-worker
-docker tag local/emby-theme-worker:rollback-last-deployed local/emby-theme-worker:0.1.4
+docker tag local/emby-theme-worker:rollback-last-deployed local/emby-theme-worker:0.2.0
 docker compose up -d --force-recreate
 ```
 

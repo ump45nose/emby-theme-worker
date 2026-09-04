@@ -62,6 +62,30 @@ CREATE TABLE IF NOT EXISTS provider_health (
   last_error TEXT,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS provider_health_v2 (
+  stage TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  failures INTEGER NOT NULL DEFAULT 0,
+  circuit_until TEXT,
+  last_error TEXT,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(stage, provider)
+);
+CREATE TABLE IF NOT EXISTS replacements (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  emby_id TEXT NOT NULL,
+  old_provider TEXT NOT NULL,
+  new_resolver TEXT NOT NULL,
+  new_transport TEXT NOT NULL,
+  old_sha256 TEXT NOT NULL,
+  new_sha256 TEXT,
+  backup_path TEXT,
+  score INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  finished_at TEXT
+);
 """
 
 
@@ -80,6 +104,20 @@ class StateDB:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(items)")}
             if "failure_count" not in columns:
                 conn.execute("ALTER TABLE items ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0")
+            candidate_columns = {row[1] for row in conn.execute("PRAGMA table_info(candidates)")}
+            for name in ("resolver", "transport"):
+                if name not in candidate_columns:
+                    conn.execute(f"ALTER TABLE candidates ADD COLUMN {name} TEXT")
+            pipeline_version = conn.execute("SELECT value FROM meta WHERE key='provider_pipeline_version'").fetchone()
+            if not pipeline_version or pipeline_version[0] != "2":
+                conn.execute(
+                    "UPDATE items SET retry_after=NULL WHERE status='failed' "
+                    "AND last_error_class IN ('network','not_found','low_score')"
+                )
+                conn.execute(
+                    "INSERT INTO meta(key,value) VALUES('provider_pipeline_version','2') "
+                    "ON CONFLICT(key) DO UPDATE SET value='2'"
+                )
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -191,8 +229,37 @@ class StateDB:
     def record_candidate(self, item_id: str, candidate: Candidate, url_hash: str) -> None:
         with self.connect() as conn:
             conn.execute(
-                "INSERT INTO candidates(emby_id,provider,title,source_url_hash,score,exact,metadata,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                (item_id, candidate.provider, candidate.title, url_hash, candidate.score, int(candidate.exact), json.dumps(candidate.metadata), now()),
+                "INSERT INTO candidates(emby_id,provider,title,source_url_hash,score,exact,metadata,created_at,resolver,transport) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (item_id, candidate.provider, candidate.title, url_hash, candidate.score, int(candidate.exact), json.dumps(candidate.metadata), now(), candidate.resolver, candidate.transport),
+            )
+
+    def local_opening_items(self, item_type: str | None = None) -> list[dict]:
+        sql = "SELECT * FROM items WHERE source_provider='local_opening' AND output_sha256 IS NOT NULL"
+        args: tuple[str, ...] = ()
+        if item_type:
+            sql += " AND item_type=?"
+            args = (item_type,)
+        sql += " ORDER BY updated_at,emby_id"
+        with self.connect() as conn:
+            return [dict(row) for row in conn.execute(sql, args)]
+
+    def defer_local_migration(self, item_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute("UPDATE items SET updated_at=? WHERE emby_id=?", (now(), item_id))
+
+    def start_replacement(self, item_id: str, candidate: Candidate, old_sha256: str, score: int) -> int:
+        with self.connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO replacements(emby_id,old_provider,new_resolver,new_transport,old_sha256,score,status,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (item_id, "local_opening", candidate.resolver or candidate.provider, candidate.transport or "direct_http", old_sha256, score, "running", now()),
+            )
+            return int(cur.lastrowid)
+
+    def finish_replacement(self, replacement_id: int, status: str, *, new_sha256: str | None = None, backup_path: str | None = None, error: str | None = None) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE replacements SET status=?,new_sha256=?,backup_path=?,error=?,finished_at=? WHERE id=?",
+                (status, new_sha256, backup_path, error, now(), replacement_id),
             )
 
     def is_due(self, item_id: str) -> bool:
@@ -209,41 +276,45 @@ class StateDB:
     def backoff_until(self, *, hours: int = 0, days: int = 0) -> str:
         return (datetime.now(UTC) + timedelta(hours=hours, days=days)).isoformat()
 
-    def provider_available(self, provider: str) -> bool:
+    def provider_available(self, stage: str, provider: str) -> bool:
         with self.connect() as conn:
-            row = conn.execute("SELECT circuit_until FROM provider_health WHERE provider=?", (provider,)).fetchone()
+            row = conn.execute("SELECT circuit_until FROM provider_health_v2 WHERE stage=? AND provider=?", (stage, provider)).fetchone()
         return not row or not row["circuit_until"] or datetime.fromisoformat(row["circuit_until"]) <= datetime.now(UTC)
 
-    def provider_success(self, provider: str) -> None:
+    def provider_success(self, stage: str, provider: str) -> None:
         with self.connect() as conn:
             conn.execute(
-                "INSERT INTO provider_health(provider,failures,updated_at) VALUES(?,0,?) "
-                "ON CONFLICT(provider) DO UPDATE SET failures=0,circuit_until=NULL,last_error=NULL,updated_at=excluded.updated_at",
-                (provider, now()),
+                "INSERT INTO provider_health_v2(stage,provider,failures,updated_at) VALUES(?,?,0,?) "
+                "ON CONFLICT(stage,provider) DO UPDATE SET failures=0,circuit_until=NULL,last_error=NULL,updated_at=excluded.updated_at",
+                (stage, provider, now()),
             )
 
-    def provider_failure(self, provider: str, error: str) -> None:
+    def provider_failure(self, stage: str, provider: str, error: str) -> None:
         with self.connect() as conn:
-            row = conn.execute("SELECT failures FROM provider_health WHERE provider=?", (provider,)).fetchone()
+            row = conn.execute("SELECT failures FROM provider_health_v2 WHERE stage=? AND provider=?", (stage, provider)).fetchone()
             failures = (int(row["failures"]) if row else 0) + 1
             circuit_hours = (6, 24, 72, 168)[min(max(failures - 3, 0), 3)]
             circuit = self.backoff_until(hours=circuit_hours) if failures >= 3 else None
             conn.execute(
-                "INSERT INTO provider_health(provider,failures,circuit_until,last_error,updated_at) VALUES(?,?,?,?,?) "
-                "ON CONFLICT(provider) DO UPDATE SET failures=excluded.failures,circuit_until=excluded.circuit_until,last_error=excluded.last_error,updated_at=excluded.updated_at",
-                (provider, failures, circuit, error[:500], now()),
+                "INSERT INTO provider_health_v2(stage,provider,failures,circuit_until,last_error,updated_at) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(stage,provider) DO UPDATE SET failures=excluded.failures,circuit_until=excluded.circuit_until,last_error=excluded.last_error,updated_at=excluded.updated_at",
+                (stage, provider, failures, circuit, error[:500], now()),
             )
 
     def status(self) -> dict:
         with self.connect() as conn:
             counts = {r["status"]: r["n"] for r in conn.execute("SELECT status,COUNT(*) n FROM items GROUP BY status")}
             last = conn.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 1").fetchone()
-            circuits = [dict(r) for r in conn.execute("SELECT * FROM provider_health WHERE circuit_until IS NOT NULL ORDER BY provider")]
+            circuits = [dict(r) for r in conn.execute("SELECT * FROM provider_health_v2 WHERE circuit_until IS NOT NULL ORDER BY stage,provider")]
             failures = {r["last_error_class"] or "unknown": r["n"] for r in conn.execute("SELECT last_error_class,COUNT(*) n FROM items WHERE status='failed' GROUP BY last_error_class")}
+            resolution = [dict(r) for r in conn.execute("SELECT COALESCE(resolver,provider) resolver,COALESCE(transport,'unknown') transport,COUNT(*) candidates,COUNT(DISTINCT emby_id) items FROM candidates GROUP BY 1,2 ORDER BY candidates DESC")]
+            replacements = {r["status"]: r["n"] for r in conn.execute("SELECT status,COUNT(*) n FROM replacements GROUP BY status")}
         return {
             "bootstrap_complete": self.get_meta("bootstrap_complete", "false") == "true",
             "items": counts,
             "failures": failures,
             "last_run": dict(last) if last else None,
             "provider_circuits": circuits,
+            "resolver_transport": resolution,
+            "replacements": replacements,
         }

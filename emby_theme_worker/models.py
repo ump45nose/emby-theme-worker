@@ -38,6 +38,12 @@ class Candidate:
     media_type: str | None = None
     duration: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    resolver: str | None = None
+    transport: str | None = None
+
+    def __post_init__(self) -> None:
+        self.resolver = self.resolver or self.provider
+        self.transport = self.transport or str(self.metadata.get("transport") or "direct_http")
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -47,4 +53,6 @@ class Candidate:
             "exact": self.exact,
             "year": self.year,
             "duration": self.duration,
+            "resolver": self.resolver,
+            "transport": self.transport,
         }
