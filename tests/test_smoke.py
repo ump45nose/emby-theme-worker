@@ -17,7 +17,7 @@ from emby_theme_worker.providers import Providers
 from emby_theme_worker.scoring import score_candidate
 from emby_theme_worker.security import RedactingFilter, contained, redact, safe_http_url_from_strm
 from emby_theme_worker.worker import Worker
-from emby_theme_worker.ytdlp_runner import YtDlpTimeout, _run
+from emby_theme_worker.ytdlp_runner import YtDlpTimeout, _run, _writable_cookie
 
 
 def item(path: Path, item_type: str = "Movie") -> MediaItem:
@@ -38,6 +38,16 @@ def test_ytdlp_wall_clock_timeout() -> None:
     with pytest.raises(YtDlpTimeout):
         _run([sys.executable, "-c", "import time; time.sleep(10)"], 1)
     assert time.monotonic() - started < 3
+
+
+def test_ytdlp_uses_disposable_cookie_copy(tmp_path: Path) -> None:
+    source = tmp_path / "source.cookies.txt"
+    source.write_text("secret-cookie", encoding="utf-8")
+    with _writable_cookie(str(source)) as copied:
+        assert copied and Path(copied) != source
+        Path(copied).write_text("changed", encoding="utf-8")
+    assert source.read_text(encoding="utf-8") == "secret-cookie"
+    assert copied and not Path(copied).exists()
 
 
 def test_path_containment() -> None:

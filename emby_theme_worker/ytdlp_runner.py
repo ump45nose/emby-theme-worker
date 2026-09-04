@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 
 class YtDlpError(RuntimeError):
@@ -14,6 +18,18 @@ class YtDlpError(RuntimeError):
 
 class YtDlpTimeout(YtDlpError):
     """yt-dlp exceeded its wall-clock deadline."""
+
+
+@contextmanager
+def _writable_cookie(cookie_file: str | None) -> Iterator[str | None]:
+    if not cookie_file:
+        yield None
+        return
+    with tempfile.TemporaryDirectory(prefix="yt-dlp-cookie-") as directory:
+        target = Path(directory) / "cookies.txt"
+        shutil.copyfile(cookie_file, target)
+        target.chmod(0o600)
+        yield str(target)
 
 
 def _run(command: list[str], timeout_seconds: int) -> str:
@@ -67,12 +83,13 @@ def search(
     socket_timeout_seconds: int,
     hard_timeout_seconds: int,
 ) -> dict:
-    command = _base(socket_timeout_seconds)
-    command.extend(["--flat-playlist", "--playlist-end", "5", "--dump-single-json"])
-    if cookie_file:
-        command.extend(["--cookies", cookie_file])
-    command.extend(["--", query])
-    output = _run(command, hard_timeout_seconds)
+    with _writable_cookie(cookie_file) as cookie:
+        command = _base(socket_timeout_seconds)
+        command.extend(["--flat-playlist", "--playlist-end", "5", "--dump-single-json"])
+        if cookie:
+            command.extend(["--cookies", cookie])
+        command.extend(["--", query])
+        output = _run(command, hard_timeout_seconds)
     try:
         return json.loads(output)
     except json.JSONDecodeError as exc:
@@ -87,16 +104,17 @@ def download(
     socket_timeout_seconds: int,
     hard_timeout_seconds: int,
 ) -> None:
-    command = _base(socket_timeout_seconds)
-    command.extend([
-        "--no-playlist",
-        "--no-simulate",
-        "--format",
-        "bestaudio/best",
-        "--output",
-        str(output_template),
-    ])
-    if cookie_file:
-        command.extend(["--cookies", cookie_file])
-    command.extend(["--", source])
-    _run(command, hard_timeout_seconds)
+    with _writable_cookie(cookie_file) as cookie:
+        command = _base(socket_timeout_seconds)
+        command.extend([
+            "--no-playlist",
+            "--no-simulate",
+            "--format",
+            "bestaudio/best",
+            "--output",
+            str(output_template),
+        ])
+        if cookie:
+            command.extend(["--cookies", cookie])
+        command.extend(["--", source])
+        _run(command, hard_timeout_seconds)
